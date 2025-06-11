@@ -1,6 +1,7 @@
 import numpy as np
 import random
 import tensorflow as tf
+import torch
 
 """
 initializers
@@ -227,6 +228,56 @@ class OnPolicyBuffer(TransBuffer):
         self.reset(self.dones[-1])
         return obs, acts, dones, Rs, Advs
 
+class PPOBuffer:
+    def __init__(self, gamma=0.99, lam=0.95):
+        self.gamma = gamma
+        self.lam = lam
+        self.obs = []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
+
+    def add_transition(self, obs, action, reward, value, done):
+        self.obs.append(obs)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.values.append(value)
+        self.dones.append(done)
+
+    def compute_returns_and_advantages(self, last_value):
+        """
+        使用GAE(lambda)估计Advantage。
+        """
+        advantages = []
+        returns = []
+        gae = 0
+        values = self.values + [last_value]
+        values = [
+            torch.stack(valuei, dim=0) if isinstance(valuei, list) else valuei for valuei in values
+            ]
+
+        for t in reversed(range(len(self.rewards))):
+            delta = self.rewards[t] + self.gamma * values[t + 1] * (1 - self.dones[t]) - values[t]
+            gae = delta + self.gamma * self.lam * (1 - self.dones[t]) * gae
+            advantages.insert(0, gae)
+            returns.insert(0, gae + values[t])
+        # print('out trainer', self.obs[0])
+        # input()
+        return (
+            self.obs,
+            torch.tensor(self.actions, dtype=torch.int64),
+            torch.tensor(self.dones, dtype=torch.float32),
+            returns,
+            advantages
+        )
+
+    def clear(self):
+        self.obs.clear()
+        self.actions.clear()
+        self.rewards.clear()
+        self.values.clear()
+        self.dones.clear()
 
 class ReplayBuffer(TransBuffer):
     def __init__(self, buffer_size, batch_size):

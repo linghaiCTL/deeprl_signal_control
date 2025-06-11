@@ -2,6 +2,7 @@ import itertools
 import logging
 import numpy as np
 import tensorflow as tf
+import torch
 import time
 import os
 import pandas as pd
@@ -155,6 +156,11 @@ class Trainer():
                     action = []
                     for pi in policy:
                         action.append(np.random.choice(np.arange(len(pi)), p=pi))
+            elif self.agent.endswith('ppo'):
+                policy, value = self.model.forward(ob, done)
+                action = []
+                for pi in policy:
+                    action.append(np.random.choice(np.arange(len(pi)), p=pi))
             else:
                 action, policy = self.model.forward(ob, mode='explore')
             next_ob, reward, done, global_reward = self.env.step(action)
@@ -301,6 +307,7 @@ class Trainer():
                    'test_id': -1,
                    'avg_reward': mean_reward,
                    'std_reward': std_reward}
+            print(log)
             self.data.append(log)
             self._add_summary(mean_reward, global_step)
             self.summary_writer.flush()
@@ -386,3 +393,153 @@ class Evaluator(Tester):
             time.sleep(2)
             self.env.collect_tripinfo()
         self.env.output_data()
+
+class TorchTrainer():
+    def __init__(self, env, model, global_counter, summary_writer, run_test, output_path=None):
+        self.cur_step = 0
+        self.global_counter = global_counter
+        self.env = env
+        self.agent = self.env.agent
+        self.model = model
+        self.n_step = self.model.n_step
+        self.summary_writer = summary_writer
+        self.run_test = run_test
+        assert self.env.T % self.n_step == 0
+        self.data = []
+        self.output_path = output_path
+        if run_test:
+            self.test_num = self.env.test_num
+            logging.info('Testing: total test num: %d' % self.test_num)
+        self._init_summary()
+
+    def _init_summary(self):
+        self.train_reward = torch.tensor(0.0)
+        self.test_reward = torch.tensor(0.0)
+
+    def _add_summary(self, reward, global_step, is_train=True):
+        pass
+
+    def explore(self, prev_ob, prev_done):
+        ob = prev_ob
+        # print('in trainer',ob)
+        done = prev_done
+        rewards = []
+
+        for _ in range(self.n_step):
+            policy, value = self.model.forward(ob, done)
+
+            action = []
+            for pi in policy:
+                pi_np = pi.detach().cpu().numpy()
+                sampled = np.random.choice(np.arange(len(pi_np)), p=pi_np)
+                action.append(sampled)
+
+            next_ob_np, reward_np, done, global_reward = self.env.step(action)
+
+            next_ob = [torch.from_numpy(next_obi).float() for next_obi in next_ob_np]
+            reward = torch.from_numpy(np.array(reward_np)).float()
+
+            rewards.append(global_reward)
+            global_step = self.global_counter.next()
+            self.cur_step += 1
+
+            self.model.add_transition(ob, action, reward, value, done)
+
+            if self.global_counter.should_log():
+                logging.info(
+                    f"Training: global step {global_step}, episode step {self.cur_step}, "
+                    f"ob: {ob}, a: {action}, pi: {policy}, "
+                    f"r: {global_reward:.2f}, train r: {reward.mean():.2f}, done: {done}"
+                )
+
+            if done:
+                break
+            ob = next_ob
+
+        if done:
+            R = torch.zeros(len(policy))
+        else:
+            value = self.model.forward(ob, done, out_type='v')
+            R = value
+
+        return ob, done, R, rewards
+
+    def perform(self, test_ind, demo=False, policy_type='default'):
+        ob_np = self.env.reset(gui=demo, test_ind=test_ind)
+        ob = torch.from_numpy(ob_np).float()
+        done = True
+        self.model.reset()
+        rewards = []
+
+        while True:
+            policy, _ = self.model.forward(ob, done, out_type='p')
+            action = []
+            for pi in policy:
+                pi_np = pi.detach().cpu().numpy()
+                if policy_type != 'deterministic':
+                    sampled = np.random.choice(np.arange(len(pi_np)), p=pi_np)
+                else:
+                    sampled = np.argmax(pi_np)
+                action.append(sampled)
+
+            next_ob_np, reward_np, done, global_reward = self.env.step(action)
+            rewards.append(global_reward)
+            if done:
+                break
+            ob = torch.from_numpy(next_ob_np).float()
+
+        mean_reward = np.mean(rewards)
+        std_reward = np.std(rewards)
+        return mean_reward, std_reward
+
+    def run(self):
+        while not self.global_counter.should_stop():
+            if self.run_test and self.global_counter.should_test():
+                rewards = []
+                global_step = self.global_counter.cur_step
+                self.env.train_mode = False
+                for test_ind in range(self.test_num):
+                    mean_reward, std_reward = self.perform(test_ind)
+                    self.env.terminate()
+                    rewards.append(mean_reward)
+                    log = {'agent': self.agent,
+                           'step': global_step,
+                           'test_id': test_ind,
+                           'avg_reward': mean_reward,
+                           'std_reward': std_reward}
+                    self.data.append(log)
+                avg_reward = np.mean(rewards)
+                self._add_summary(avg_reward, global_step, is_train=False)
+                logging.info(f"Testing: global step {global_step}, avg R: {avg_reward:.2f}")
+
+            self.env.train_mode = True
+            ob_np = self.env.reset()
+            ob = [torch.from_numpy(obi).float() for obi in ob_np]
+            done = True
+            self.model.reset()
+            self.cur_step = 0
+            rewards = []
+
+            while True:
+                ob, done, R, cur_rewards = self.explore(ob, done)
+                rewards += cur_rewards
+                global_step = self.global_counter.cur_step
+                self.model.backward(R, global_step)
+                if done:
+                    self.env.terminate()
+                    break
+
+            mean_reward = np.mean(rewards)
+            std_reward = np.std(rewards)
+            log = {'agent': self.agent,
+                   'step': global_step,
+                   'test_id': -1,
+                   'avg_reward': mean_reward,
+                   'std_reward': std_reward}
+            print(log)
+            self.data.append(log)
+            self._add_summary(mean_reward, global_step)
+            self.summary_writer.flush()
+
+        df = pd.DataFrame(self.data)
+        df.to_csv(self.output_path + 'train_reward.csv')

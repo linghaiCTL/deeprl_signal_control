@@ -2,6 +2,9 @@ import numpy as np
 import tensorflow as tf
 from agents.utils import *
 import bisect
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ACPolicy:
@@ -161,6 +164,74 @@ class LstmACPolicy(ACPolicy):
         if 'v' in out_type:
             outs.append(self.v_fw)
         return outs
+
+class TorchLstmPPOPolicy(nn.Module):
+    def __init__(self, n_s, n_a, n_w, n_step, model_config, agent_name=None):
+        super(TorchLstmPPOPolicy, self).__init__()
+        self.name = f"{agent_name}_ppo" if agent_name else "ppo"
+        self.n_s = n_s
+        self.n_a = n_a
+        self.n_w = n_w
+        self.n_step = n_step
+
+        # 解析网络结构超参
+        n_fc_wave = model_config.getint('num_fw', fallback=64)
+        n_fc_wait = model_config.getint('num_ft', fallback=64)
+        n_lstm = model_config.getint('num_lstm', fallback=128)
+
+        self.fc1 = nn.Linear(n_s + n_w, n_fc_wave)
+        self.fc2 = nn.Linear(n_fc_wave, n_fc_wait)
+        self.lstm = nn.LSTM(n_fc_wait, n_lstm, batch_first=True)
+        # Actor网络
+        self.actor_out = nn.Linear(n_lstm, n_a)
+
+        # Critic网络
+        self.critic_out = nn.Linear(n_lstm, 1)
+
+        # LSTM隐藏状态
+        self.hidden = None
+
+    def forward(self, obs, done, out_type='pv'):
+        """
+        obs: [B, n_s] or [B, T, n_s]
+        """
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        # 重置LSTM
+        if done or self.hidden is None:
+            self.hidden = (torch.zeros(1, obs.shape[0], self.lstm.hidden_size),
+                           torch.zeros(1, obs.shape[0], self.lstm.hidden_size))
+            if obs.is_cuda:
+                self.hidden = (self.hidden[0].cuda(), self.hidden[1].cuda())
+
+        x = F.relu(self.fc1(obs))
+        x = F.relu(self.fc2(x))
+        x = x.unsqueeze(1)  # [B, 1, D]
+        lstm_out, self.hidden = self.lstm(x, self.hidden)
+        # Actor
+        logits = self.actor_out(lstm_out.squeeze(1).squeeze(0))  # [B, n_a]
+        probs = F.softmax(logits, dim=-1)
+        # Critic
+        value = self.critic_out(lstm_out.squeeze(1).squeeze(0)).squeeze(-1)  # [B]
+
+        if out_type == 'pv':
+            return probs, value
+        elif out_type == 'p':
+            return probs
+        elif out_type == 'v':
+            return value
+        else:
+            raise ValueError(f"Unsupported out_type: {out_type}")
+
+    def reset(self):
+        """
+        清空LSTM状态
+        """
+        self.hidden = None
+
+
+
+
 
 
 class FPLstmACPolicy(LstmACPolicy):

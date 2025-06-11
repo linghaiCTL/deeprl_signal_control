@@ -11,7 +11,6 @@ import multiprocessing as mp
 import numpy as np
 import tensorflow as tf
 
-
 class A2C:
     def __init__(self, n_s, n_a, total_step, model_config, seed=0, n_f=None):
         # load parameters
@@ -149,8 +148,7 @@ class IA2C(A2C):
         self.policy_ls = []
         for i, (n_s, n_w, n_a) in enumerate(zip(self.n_s_ls, self.n_w_ls, self.n_a_ls)):
             # agent_name is needed to differentiate multi-agents
-            self.policy_ls.append(self._init_policy(n_s - n_w, n_a, n_w, 0, model_config,
-                                  agent_name='{:d}a'.format(i)))
+            self.policy_ls.append(self._init_policy(n_s - n_w, n_a, n_w, 0, model_config, agent_name='{:d}a'.format(i)))
         self.saver = tf.train.Saver(max_to_keep=5)
         if total_step:
             # training
@@ -227,6 +225,7 @@ class IA2C(A2C):
         for i in range(self.n_agent):
             self.trans_buffer_ls[i].add_transition(obs[i], actions[i],
                                                    rewards[i], values[i], done)
+
 
 
 class MA2C(IA2C):
@@ -374,3 +373,133 @@ class IQL(A2C):
         for i in range(self.n_agent):
             self.trans_buffer_ls[i].add_transition(obs[i], actions[i],
                                                    rewards[i], next_obs[i], done)
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+class MultiAgentPolicyPPOWrapper:
+    def __init__(self, n_s_ls, n_a_ls, n_w_ls, model_config):
+        self.n_agent = len(n_s_ls)
+        self.policy_ls = []
+        self.name = 'ippo'
+        self.n_step = model_config.getint('batch_size')
+
+        for i, (n_s, n_w, n_a) in enumerate(zip(n_s_ls, n_w_ls, n_a_ls)):
+            policy = TorchLstmPPOPolicy(
+                n_s=n_s - n_w, 
+                n_a=n_a, 
+                n_w=n_w,
+                n_step = self.n_step,
+                model_config=model_config,
+                agent_name=f"{i}a"
+            )
+            self.policy_ls.append(policy)
+        
+        all_params = []
+        for policy in self.policy_ls:
+            all_params += list(policy.parameters())
+        self.optimizer = optim.Adam(all_params, lr=model_config.getfloat('lr_init'))
+        self.parameters = all_params
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer, 
+            step_size=1000,  
+            gamma= 0.95) 
+        # Buffer
+        self.buffer = PPOBuffer(
+            gamma=model_config.getfloat("gamma"),
+            lam=model_config.getfloat("gae_lambda", fallback=0.95)
+        )
+
+            
+    def forward(self, obs, done, out_type='pv'):
+        """
+        obs: List of obs for each agent [obs_0, obs_1, ..., obs_n]
+        done: bool, done flag (usually reset lstm)
+        out_type: 'pv', 'p', 'v'
+        """
+        out1, out2 = [], []
+        for i in range(self.n_agent):
+            cur_out = self.policy_ls[i].forward(obs[i], done, out_type)
+            if isinstance(cur_out, tuple):
+                out1.append(cur_out[0])
+                out2.append(cur_out[1])
+            else:
+                out1.append(cur_out)
+        if out2:
+            return out1, out2
+        else:
+            return out1
+
+    def add_transition(self, obs, action, reward, value, done):
+        self.buffer.add_transition(obs, action, reward, value, done)
+
+    def backward(self, R, global_step=None):
+        obs, actions, dones, returns, advantages = self.buffer.compute_returns_and_advantages(R)
+
+        self.optimizer.zero_grad()
+        policy_loss, value_loss, entropy_loss = 0.0, 0.0, 0.0
+
+        for t in range(len(obs)):
+            ob = obs[t]
+            action = actions[t].detach()
+            done = dones[t].detach()
+            returnt = returns[t].detach()
+            advantage = advantages[t].detach()
+            for i, policy in enumerate(self.policy_ls):
+                # Actor部分
+                policy.reset()
+                logits, values = policy.forward(ob[i], done, out_type='pv')
+                dist = torch.distributions.Categorical(logits=logits)
+                log_probs = dist.log_prob(action[i])
+                entropy = dist.entropy().mean()
+
+                # Advantage
+                adv = advantage[i]
+                log_probs = log_probs.squeeze()
+                policy_loss_i = -(log_probs * adv).mean()
+
+                # Critic部分
+                returns_i = returnt[i]
+                values = values.squeeze()
+                value_loss_i = F.mse_loss(values, returns_i)
+
+                # 累加
+                policy_loss += policy_loss_i
+                value_loss += value_loss_i
+                entropy_loss += entropy
+
+        total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
+        total_loss.backward()
+        print('backward once')
+        total_loss.detach()
+        nn.utils.clip_grad_norm_(self.parameters, max_norm=0.5)
+        self.optimizer.step()
+        self.scheduler.step()
+
+        self.buffer.clear()
+
+    def reset(self):
+        """
+        清空每个policy的LSTM隐藏状态。
+        """
+        for policy in self.policy_ls:
+            policy.reset()
+            
+    def save(self, path, final_step=None):
+        state_dict = {
+            'policies': [policy.state_dict() for policy in self.policy_ls],
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+        }
+        torch.save(state_dict, path)
+        print(f"Model saved to {path}")
+
+    def load(self, path, map_location=None):
+        checkpoint = torch.load(path, map_location=map_location)
+        for policy, policy_state in zip(self.policy_ls, checkpoint['policies']):
+            policy.load_state_dict(policy_state)
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        print(f"Model loaded from {path}")
