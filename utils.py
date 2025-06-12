@@ -466,13 +466,13 @@ class TorchTrainer():
 
     def perform(self, test_ind, demo=False, policy_type='default'):
         ob_np = self.env.reset(gui=demo, test_ind=test_ind)
-        ob = torch.from_numpy(ob_np).float()
+        ob = [torch.from_numpy(obi).float() for obi in ob_np]
         done = True
         self.model.reset()
         rewards = []
 
         while True:
-            policy, _ = self.model.forward(ob, done, out_type='p')
+            policy, value = self.model.forward(ob, done)
             action = []
             for pi in policy:
                 pi_np = pi.detach().cpu().numpy()
@@ -486,7 +486,7 @@ class TorchTrainer():
             rewards.append(global_reward)
             if done:
                 break
-            ob = torch.from_numpy(next_ob_np).float()
+            ob = [torch.from_numpy(next_obi).float() for next_obi in next_ob_np]
 
         mean_reward = np.mean(rewards)
         std_reward = np.std(rewards)
@@ -543,3 +543,83 @@ class TorchTrainer():
 
         df = pd.DataFrame(self.data)
         df.to_csv(self.output_path + 'train_reward.csv')
+        
+        
+class TorchTester(TorchTrainer):
+    def __init__(self, env, model, global_counter, summary_writer, output_path):
+        super().__init__(env, model, global_counter, summary_writer)
+        self.env.train_mode = False
+        self.test_num = self.env.test_num
+        self.output_path = output_path
+        self.data = []
+        logging.info('Testing: total test num: %d' % self.test_num)
+
+    def _init_summary(self):
+        self.reward = tf.placeholder(tf.float32, [])
+        self.summary = tf.summary.scalar('test_reward', self.reward)
+
+    def run_offline(self):
+        # enable traffic measurments for offline test
+        is_record = True
+        record_stats = False
+        self.env.cur_episode = 0
+        self.env.init_data(is_record, record_stats, self.output_path)
+        rewards = []
+        for test_ind in range(self.test_num):
+            rewards.append(self.perform(test_ind))
+            self.env.terminate()
+            time.sleep(2)
+            self.env.collect_tripinfo()
+        avg_reward = np.mean(np.array(rewards))
+        logging.info('Offline testing: avg R: %.2f' % avg_reward)
+        self.env.output_data()
+
+    def run_online(self, coord):
+        self.env.cur_episode = 0
+        while not coord.should_stop():
+            time.sleep(30)
+            if self.global_counter.should_test():
+                rewards = []
+                global_step = self.global_counter.cur_step
+                for test_ind in range(self.test_num):
+                    cur_reward = self.perform(test_ind)
+                    self.env.terminate()
+                    rewards.append(cur_reward)
+                    log = {'agent': self.agent,
+                           'step': global_step,
+                           'test_id': test_ind,
+                           'reward': cur_reward}
+                    self.data.append(log)
+                avg_reward = np.mean(np.array(rewards))
+                self._add_summary(avg_reward, global_step)
+                logging.info('Testing: global step %d, avg R: %.2f' %
+                             (global_step, avg_reward))
+                # self.global_counter.update_test(avg_reward)
+        df = pd.DataFrame(self.data)
+        df.to_csv(self.output_path + 'train_reward.csv')
+
+
+class TorchEvaluator(TorchTester):
+    def __init__(self, env, model, output_path, demo=False, policy_type='default'):
+        self.env = env
+        self.model = model
+        self.agent = self.env.agent
+        self.env.train_mode = False
+        self.test_num = self.env.test_num
+        self.output_path = output_path
+        self.demo = demo
+        self.policy_type = policy_type
+
+    def run(self):
+        is_record = True
+        record_stats = False
+        self.env.cur_episode = 0
+        self.env.init_data(is_record, record_stats, self.output_path)
+        time.sleep(1)
+        for test_ind in range(self.test_num):
+            reward, _ = self.perform(test_ind, demo=self.demo, policy_type=self.policy_type)
+            self.env.terminate()
+            logging.info('test %i, avg reward %.2f' % (test_ind, reward))
+            time.sleep(2)
+            self.env.collect_tripinfo()
+        self.env.output_data()

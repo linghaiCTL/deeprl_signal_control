@@ -12,8 +12,8 @@ import threading
 from envs.small_grid_env import SmallGridEnv, SmallGridController
 from envs.large_grid_env import LargeGridEnv, LargeGridController
 from envs.real_net_env import RealNetEnv, RealNetController
-from agents.models import A2C, IA2C, MA2C, IQL
-from utils import (Counter, Trainer, Tester, Evaluator,
+from agents.models import A2C, IA2C, MA2C, IQL, MultiAgentPolicyPPOWrapper, MultiAgentPolicyIC3NetWrapper,MultiAgentPolicyIC3NetAttnWrapper
+from utils import (Counter, Trainer, Tester, Evaluator, TorchTrainer, TorchEvaluator,
                    check_dir, copy_file, find_file,
                    init_dir, init_log, init_test_flag,
                    plot_evaluation, plot_train)
@@ -102,57 +102,33 @@ def train(args):
 
     # init centralized or multi agent
     seed = config.getint('ENV_CONFIG', 'seed')
-    # coord = tf.train.Coordinator()
-
-    # if env.agent == 'a2c':
-    #     model = A2C(env.n_s, env.n_a, total_step,
-    #                 config['MODEL_CONFIG'], seed=seed)
-    if 'ia2c' in env.agent:
-        model = IA2C(env.n_s_ls, env.n_a_ls, env.n_w_ls, total_step,
-                     config['MODEL_CONFIG'], seed=seed)
-    elif 'ma2c' in env.agent:
-        model = MA2C(env.n_s_ls, env.n_a_ls, env.n_w_ls, env.n_f_ls, total_step,
-                     config['MODEL_CONFIG'], seed=seed)
-    elif env.agent == 'iqld':
-        model = IQL(env.n_s_ls, env.n_a_ls, env.n_w_ls, total_step, config['MODEL_CONFIG'],
-                    seed=0, model_type='dqn')
+    if env.agent == 'ippo':
+        model = MultiAgentPolicyPPOWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
+        print("Using policy IPPO")
+    elif env.agent == 'ic3net':
+        model = MultiAgentPolicyIC3NetWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
+        print("Using policy IC3Net")
+    elif env.agent == 'ic3netattn':
+        model = MultiAgentPolicyIC3NetAttnWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
+        print("Using policy IC3Net with Attention")
     else:
-        model = IQL(env.n_s_ls, env.n_a_ls, env.n_w_ls, total_step, config['MODEL_CONFIG'],
-                    seed=0, model_type='lr')
+        print('Not support torch yet')
 
     # disable multi-threading for safe SUMO implementation
     # threads = []
     summary_writer = tf.summary.FileWriter(dirs['log'])
-    trainer = Trainer(env, model, global_counter, summary_writer, in_test, output_path=dirs['data'])
+    trainer = TorchTrainer(env, model, global_counter, summary_writer, in_test, output_path=dirs['data'])
     trainer.run()
-    # if in_test or post_test:
-    #     # assign a different port for test env
-    #     test_env = init_env(config['ENV_CONFIG'], port=1)
-    #     tester = Tester(test_env, model, global_counter, summary_writer, dirs['data'])
-
-    # def train_fn():
-    #     trainer.run(coord)
-
-    # thread = threading.Thread(target=train_fn)
-    # thread.start()
-    # threads.append(thread)
-    # if in_test:
-    #     def test_fn():
-    #         tester.run_online(coord)
-    #     thread = threading.Thread(target=test_fn)
-    #     thread.start()
-    #     threads.append(thread)
-    # coord.join(threads)
 
     # post-training test
-    if post_test:
-        tester = Tester(env, model, global_counter, summary_writer, dirs['data'])
-        tester.run_offline(dirs['data'])
+    # if post_test:
+    #     tester = Tester(env, model, global_counter, summary_writer, dirs['data'])
+    #     tester.run_offline(dirs['data'])
 
     # save model
     final_step = global_counter.cur_step
     logging.info('Training: save final model at step %d ...' % final_step)
-    model.save(dirs['model'], final_step)
+    model.save(dirs['model']+'/model.pt', final_step)
 
 
 def evaluate_fn(agent_dir, output_dir, seeds, port, demo, policy_type):
@@ -178,23 +154,32 @@ def evaluate_fn(agent_dir, output_dir, seeds, port, demo, policy_type):
         # init centralized or multi agent
         if agent == 'a2c':
             model = A2C(env.n_s, env.n_a, 0, config['MODEL_CONFIG'])
-        elif 'ia2c' in env.agent:
+        elif agent == 'ia2c':
             model = IA2C(env.n_s_ls, env.n_a_ls, env.n_w_ls, 0, config['MODEL_CONFIG'])
-        elif 'ma2c' in env.agent:
+        elif 'ma2c' in agent:
             model = MA2C(env.n_s_ls, env.n_a_ls, env.n_w_ls, env.n_f_ls, 0, config['MODEL_CONFIG'])
+        elif 'ippo' in agent:
+            model = MultiAgentPolicyPPOWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
+            print("Eval policy IPPO")
+        elif 'ic3netattn' in agent:
+            model = MultiAgentPolicyIC3NetAttnWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
+            print("Eval policy IC3Net with attention")
+        elif 'ic3net' in agent:
+            model = MultiAgentPolicyIC3NetWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
+            print("Eval policy IC3Net")
         elif agent == 'iqld':
             model = IQL(env.n_s_ls, env.n_a_ls, env.n_w_ls, 0, config['MODEL_CONFIG'],
                         seed=0, model_type='dqn')
         else:
             model = IQL(env.n_s_ls, env.n_a_ls, env.n_w_ls, 0, config['MODEL_CONFIG'],
                         seed=0, model_type='lr')
-        if not model.load(agent_dir + '/model/'):
+        if not model.load(agent_dir + '/model/model.pt'):
             return
     else:
         model = greedy_policy
     env.agent = agent
     # collect evaluation data
-    evaluator = Evaluator(env, model, output_dir, demo=demo, policy_type=policy_type)
+    evaluator = TorchEvaluator(env, model, output_dir, demo=demo, policy_type=policy_type)
     evaluator.run()
 
 

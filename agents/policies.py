@@ -230,7 +230,166 @@ class TorchLstmPPOPolicy(nn.Module):
         self.hidden = None
 
 
+class TorchLstmIC3NetPolicy(nn.Module):
+    def __init__(self, n_s, n_a, n_w, n_step, model_config, agent_name=None):
+        super(TorchLstmIC3NetPolicy, self).__init__()
+        self.name = f"{agent_name}_ic3net" if agent_name else "ic3net"
+        self.n_s = n_s
+        self.n_a = n_a
+        self.n_w = n_w
+        self.n_step = n_step
 
+        # 解析网络结构超参
+        n_fc_wave = model_config.getint('num_fw', fallback=64)
+        n_fc_wait = model_config.getint('num_ft', fallback=64)
+        n_lstm = model_config.getint('num_lstm', fallback=128)
+        n_c = n_lstm # 沟通的变量维度和lstm隐变量维度一致
+
+        self.fc1 = nn.Linear(n_s + n_w + n_c, n_fc_wave)
+        self.fc2 = nn.Linear(n_fc_wave, n_fc_wait)
+        self.lstm = nn.LSTM(n_fc_wait, n_lstm, batch_first=True)
+        # Actor网络
+        self.actor_out = nn.Linear(n_lstm, n_a)
+
+        # Critic网络
+        self.critic_out = nn.Linear(n_lstm, 1)
+
+        # LSTM隐藏状态
+        self.hidden = None
+        
+        # communicate网络
+        self.comm_gate = nn.Linear(n_lstm, n_lstm)
+
+    def forward(self, obs, done, comm, out_type='pv'):
+        """
+        obs: [B, n_s] or [B, T, n_s]
+        """
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        obs = torch.cat([obs, comm], dim=-1)
+        # 重置LSTM
+        if done or self.hidden is None:
+            self.hidden = (torch.zeros(1, obs.shape[0], self.lstm.hidden_size),
+                           torch.zeros(1, obs.shape[0], self.lstm.hidden_size))
+            if obs.is_cuda:
+                self.hidden = (self.hidden[0].cuda(), self.hidden[1].cuda())
+
+        x = F.relu(self.fc1(obs))
+        x = F.relu(self.fc2(x))
+        x = x.unsqueeze(1)  # [B, 1, D]
+        lstm_out, self.hidden = self.lstm(x, self.hidden)
+        # Actor
+        logits = self.actor_out(lstm_out.squeeze(1).squeeze(0))  # [B, n_a]
+        probs = F.softmax(logits, dim=-1)
+        # Critic
+        value = self.critic_out(lstm_out.squeeze(1).squeeze(0)).squeeze(-1)  # [B]
+        # Comm
+        comm = F.sigmoid(self.comm_gate(lstm_out)) * lstm_out 
+        comm = comm.squeeze(0)
+
+        if out_type == 'pv':
+            return probs, value, comm
+        elif out_type == 'p':
+            return probs, comm
+        elif out_type == 'v':
+            return value, comm
+        else:
+            raise ValueError(f"Unsupported out_type: {out_type}")
+
+    def reset(self):
+        """
+        清空LSTM状态
+        """
+        self.hidden = None
+
+
+
+class TorchLstmIC3NetAttnPolicy(nn.Module):
+    def __init__(self, n_s, n_a, n_w, n_step, model_config, agent_name=None):
+        super(TorchLstmIC3NetAttnPolicy, self).__init__()
+        self.name = f"{agent_name}_ic3net" if agent_name else "ic3net"
+        self.n_s = n_s
+        self.n_a = n_a
+        self.n_w = n_w
+        self.n_step = n_step
+
+        # 解析网络结构超参
+        n_fc_wave = model_config.getint('num_fw', fallback=64)
+        n_fc_wait = model_config.getint('num_ft', fallback=64)
+        n_lstm = model_config.getint('num_lstm', fallback=128)
+        self.n_lstm=n_lstm
+        n_c = n_lstm # 沟通的变量维度和lstm隐变量维度一致
+        
+        # communicate网络，使用attention机制接收输入
+        self.comm_q = nn.Linear(n_lstm, n_lstm)
+        self.comm_k = nn.Linear(n_lstm, n_lstm)
+        self.comm_v = nn.Linear(n_lstm, n_lstm)
+        self.comm_out = nn.Linear(n_lstm, n_lstm)
+
+        self.fc1 = nn.Linear(n_s + n_w + n_c, n_fc_wave)
+        self.fc2 = nn.Linear(n_fc_wave, n_fc_wait)
+        self.lstm = nn.LSTM(n_fc_wait, n_lstm, batch_first=True)
+        # Actor网络
+        self.actor_out = nn.Linear(n_lstm, n_a)
+
+        # Critic网络
+        self.critic_out = nn.Linear(n_lstm, 1)
+
+        # LSTM隐藏状态
+        self.hidden = None
+        
+
+    def forward(self, obs, done, comm, out_type='pv'):
+        """
+        obs: [B, n_s] or [B, T, n_s]
+        """
+        # 基于attention机制处理comm
+        comm = comm.unsqueeze(0)  # (1, n_agent, n_lstm)
+        Q = self.comm_q(comm)  # (1, n_agent, n_lstm)
+        K = self.comm_k(comm)  # (1, n_agent, n_lstm)
+        V = self.comm_v(comm)  # (1, n_agent, n_lstm)
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.n_lstm ** 0.5)  # (1, n_agent, n_agent)
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (1, n_agent, n_agent)
+        attn_output = torch.matmul(attn_weights, V)  # (1, n_agent, n_lstm)
+        new_comm = self.comm_out(attn_output.mean(dim=1))  # (1, n_lstm)
+        
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        obs = torch.cat([obs, new_comm], dim=-1)
+        # 重置LSTM
+        if done or self.hidden is None:
+            self.hidden = (torch.zeros(1, obs.shape[0], self.lstm.hidden_size),
+                           torch.zeros(1, obs.shape[0], self.lstm.hidden_size))
+            if obs.is_cuda:
+                self.hidden = (self.hidden[0].cuda(), self.hidden[1].cuda())
+
+        x = F.relu(self.fc1(obs))
+        x = F.relu(self.fc2(x))
+        x = x.unsqueeze(1)  # [B, 1, D]
+        lstm_out, self.hidden = self.lstm(x, self.hidden)
+        # Actor
+        logits = self.actor_out(lstm_out.squeeze(1).squeeze(0))  # [B, n_a]
+        probs = F.softmax(logits, dim=-1)
+        # Critic
+        value = self.critic_out(lstm_out.squeeze(1).squeeze(0)).squeeze(-1)  # [B]
+        # Comm
+        comm = lstm_out 
+        comm = comm.squeeze(0).squeeze(0)
+
+        if out_type == 'pv':
+            return probs, value, comm
+        elif out_type == 'p':
+            return probs, comm
+        elif out_type == 'v':
+            return value, comm
+        else:
+            raise ValueError(f"Unsupported out_type: {out_type}")
+
+    def reset(self):
+        """
+        清空LSTM状态
+        """
+        self.hidden = None
 
 
 

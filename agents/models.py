@@ -503,3 +503,276 @@ class MultiAgentPolicyPPOWrapper:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         print(f"Model loaded from {path}")
+        return True
+        
+        
+class MultiAgentPolicyIC3NetWrapper:
+    def __init__(self, n_s_ls, n_a_ls, n_w_ls, model_config):
+        self.n_agent = len(n_s_ls)
+        self.policy_ls = []
+        self.name = 'ic3net'
+        self.n_step = model_config.getint('batch_size')
+        self.n_c = model_config.getint('num_lstm', fallback=128)
+
+        for i, (n_s, n_w, n_a) in enumerate(zip(n_s_ls, n_w_ls, n_a_ls)):
+            policy = TorchLstmIC3NetPolicy(
+                n_s=n_s - n_w, 
+                n_a=n_a, 
+                n_w=n_w,
+                n_step = self.n_step,
+                model_config=model_config,
+                agent_name=f"{i}a"
+            )
+            self.policy_ls.append(policy)
+        
+        all_params = []
+        for policy in self.policy_ls:
+            all_params += list(policy.parameters())
+        self.optimizer = optim.Adam(all_params, lr=model_config.getfloat('lr_init'))
+        self.parameters = all_params
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer, 
+            step_size=1000,  
+            gamma= 0.95) 
+        # Buffer
+        self.buffer = PPOBuffer(
+            gamma=model_config.getfloat("gamma"),
+            lam=model_config.getfloat("gae_lambda", fallback=0.95)
+        )
+        self.comm = torch.zeros((1, self.n_c))
+
+            
+    def forward(self, obs, done, out_type='pv'):
+        """
+        obs: List of obs for each agent [obs_0, obs_1, ..., obs_n]
+        done: bool, done flag (usually reset lstm)
+        out_type: 'pv', 'p', 'v'
+        """
+        out1, out2 = [], []
+        comm = torch.zeros((1, self.n_c))
+        for i in range(self.n_agent):
+            cur_out = self.policy_ls[i].forward(obs[i], done, self.comm, out_type)
+            if out_type=='pv':
+                out1.append(cur_out[0])
+                out2.append(cur_out[1])
+            else:
+                out1.append(cur_out[0])
+            comm = comm + cur_out[-1]
+        self.comm = comm/self.n_agent
+        if out2:
+            return out1, out2
+        else:
+            return out1
+
+    def add_transition(self, obs, action, reward, value, done):
+        self.buffer.add_transition(obs, action, reward, value, done)
+
+    def backward(self, R, global_step=None):
+        obs, actions, dones, returns, advantages = self.buffer.compute_returns_and_advantages(R)
+
+        self.optimizer.zero_grad()
+        policy_loss, value_loss, entropy_loss = 0.0, 0.0, 0.0
+        self.comm = torch.zeros((1, self.n_c))
+
+        for t in range(len(obs)):
+            ob = obs[t]
+            action = actions[t].detach()
+            done = dones[t].detach()
+            returnt = returns[t].detach()
+            advantage = advantages[t].detach()
+            comm = torch.zeros((1, self.n_c))
+            for i, policy in enumerate(self.policy_ls):
+                # Actor部分
+                policy.reset()
+                logits, values, commi = policy.forward(ob[i], done, self.comm, out_type='pv')
+                dist = torch.distributions.Categorical(logits=logits)
+                log_probs = dist.log_prob(action[i])
+                entropy = dist.entropy().mean()
+                comm = comm + commi
+                # Advantage
+                adv = advantage[i]
+                log_probs = log_probs.squeeze()
+                policy_loss_i = -(log_probs * adv).mean()
+
+                # Critic部分
+                returns_i = returnt[i]
+                values = values.squeeze()
+                value_loss_i = F.mse_loss(values, returns_i)
+
+                # 累加
+                policy_loss += policy_loss_i
+                value_loss += value_loss_i
+                entropy_loss += entropy
+            self.comm = comm / self.n_agent
+
+        total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
+        total_loss.backward()
+        print('backward once')
+        total_loss.detach()
+        nn.utils.clip_grad_norm_(self.parameters, max_norm=0.5)
+        self.optimizer.step()
+        self.scheduler.step()
+
+        self.buffer.clear()
+
+    def reset(self):
+        """
+        清空每个policy的LSTM隐藏状态。
+        """
+        for policy in self.policy_ls:
+            policy.reset()
+        self.comm = torch.zeros((1, self.n_c))
+            
+    def save(self, path, final_step=None):
+        state_dict = {
+            'policies': [policy.state_dict() for policy in self.policy_ls],
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+        }
+        torch.save(state_dict, path)
+        print(f"Model saved to {path}")
+
+    def load(self, path, map_location=None):
+        checkpoint = torch.load(path, map_location=map_location)
+        for policy, policy_state in zip(self.policy_ls, checkpoint['policies']):
+            policy.load_state_dict(policy_state)
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        print(f"Model loaded from {path}")
+        return True
+        
+        
+class MultiAgentPolicyIC3NetAttnWrapper:
+    def __init__(self, n_s_ls, n_a_ls, n_w_ls, model_config):
+        self.n_agent = len(n_s_ls)
+        self.policy_ls = []
+        self.name = 'ic3net'
+        self.n_step = model_config.getint('batch_size')
+        self.n_c = model_config.getint('num_lstm', fallback=128)
+
+        for i, (n_s, n_w, n_a) in enumerate(zip(n_s_ls, n_w_ls, n_a_ls)):
+            policy = TorchLstmIC3NetAttnPolicy(
+                n_s=n_s - n_w, 
+                n_a=n_a, 
+                n_w=n_w,
+                n_step = self.n_step,
+                model_config=model_config,
+                agent_name=f"{i}a"
+            )
+            self.policy_ls.append(policy)
+        
+        all_params = []
+        for policy in self.policy_ls:
+            all_params += list(policy.parameters())
+        self.optimizer = optim.Adam(all_params, lr=model_config.getfloat('lr_init'))
+        self.parameters = all_params
+        self.scheduler = optim.lr_scheduler.StepLR(
+            self.optimizer, 
+            step_size=1000,  
+            gamma= 0.95) 
+        # Buffer
+        self.buffer = PPOBuffer(
+            gamma=model_config.getfloat("gamma"),
+            lam=model_config.getfloat("gae_lambda", fallback=0.95)
+        )
+        self.comm = torch.zeros((self.n_agent, self.n_c))
+
+            
+    def forward(self, obs, done, out_type='pv'):
+        """
+        obs: List of obs for each agent [obs_0, obs_1, ..., obs_n]
+        done: bool, done flag (usually reset lstm)
+        out_type: 'pv', 'p', 'v'
+        """
+        out1, out2 = [], []
+        comm = []
+        for i in range(self.n_agent):
+            cur_out = self.policy_ls[i].forward(obs[i], done, self.comm, out_type)
+            if out_type=='pv':
+                out1.append(cur_out[0])
+                out2.append(cur_out[1])
+            else:
+                out1.append(cur_out[0])
+            comm.append(cur_out[-1])
+        self.comm = torch.stack(comm, dim=0)
+        if out2:
+            return out1, out2
+        else:
+            return out1
+
+    def add_transition(self, obs, action, reward, value, done):
+        self.buffer.add_transition(obs, action, reward, value, done)
+
+    def backward(self, R, global_step=None):
+        obs, actions, dones, returns, advantages = self.buffer.compute_returns_and_advantages(R)
+
+        self.optimizer.zero_grad()
+        policy_loss, value_loss, entropy_loss = 0.0, 0.0, 0.0
+        self.comm = torch.zeros((self.n_agent, self.n_c))
+
+        for t in range(len(obs)):
+            ob = obs[t]
+            action = actions[t].detach()
+            done = dones[t].detach()
+            returnt = returns[t].detach()
+            advantage = advantages[t].detach()
+            comm = []
+            for i, policy in enumerate(self.policy_ls):
+                # Actor部分
+                policy.reset()
+                logits, values, commi = policy.forward(ob[i], done, self.comm, out_type='pv')
+                dist = torch.distributions.Categorical(logits=logits)
+                log_probs = dist.log_prob(action[i])
+                entropy = dist.entropy().mean()
+                comm.append(commi)
+                # Advantage
+                adv = advantage[i]
+                log_probs = log_probs.squeeze()
+                policy_loss_i = -(log_probs * adv).mean()
+
+                # Critic部分
+                returns_i = returnt[i]
+                values = values.squeeze()
+                value_loss_i = F.mse_loss(values, returns_i)
+
+                # 累加
+                policy_loss += policy_loss_i
+                value_loss += value_loss_i
+                entropy_loss += entropy
+            self.comm = torch.stack(comm, dim=0)
+
+        total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
+        total_loss.backward()
+        print('backward once')
+        total_loss.detach()
+        nn.utils.clip_grad_norm_(self.parameters, max_norm=0.5)
+        self.optimizer.step()
+        self.scheduler.step()
+
+        self.buffer.clear()
+
+    def reset(self):
+        """
+        清空每个policy的LSTM隐藏状态。
+        """
+        for policy in self.policy_ls:
+            policy.reset()
+        self.comm = torch.zeros((1, self.n_c))
+            
+    def save(self, path, final_step=None):
+        state_dict = {
+            'policies': [policy.state_dict() for policy in self.policy_ls],
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+        }
+        torch.save(state_dict, path)
+        print(f"Model saved to {path}")
+
+    def load(self, path, map_location=None):
+        checkpoint = torch.load(path, map_location=map_location)
+        for policy, policy_state in zip(self.policy_ls, checkpoint['policies']):
+            policy.load_state_dict(policy_state)
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        print(f"Model loaded from {path}")
+        return True
