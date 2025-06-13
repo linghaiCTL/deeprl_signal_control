@@ -10,6 +10,10 @@ import logging
 import multiprocessing as mp
 import numpy as np
 import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 
 class A2C:
     def __init__(self, n_s, n_a, total_step, model_config, seed=0, n_f=None):
@@ -374,54 +378,83 @@ class IQL(A2C):
             self.trans_buffer_ls[i].add_transition(obs[i], actions[i],
                                                    rewards[i], next_obs[i], done)
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
-class MultiAgentPolicyPPOWrapper:
+# torch model抽象类
+class TorchWrapper:
     def __init__(self, n_s_ls, n_a_ls, n_w_ls, model_config):
         self.n_agent = len(n_s_ls)
         self.policy_ls = []
-        self.name = 'ippo'
+        self.parameters = []
+        self.optimizer = None
+        self.scheduler = None
         self.n_step = model_config.getint('batch_size')
-
-        for i, (n_s, n_w, n_a) in enumerate(zip(n_s_ls, n_w_ls, n_a_ls)):
-            policy = TorchLstmPPOPolicy(
-                n_s=n_s - n_w, 
-                n_a=n_a, 
-                n_w=n_w,
-                n_step = self.n_step,
-                model_config=model_config,
-                agent_name=f"{i}a"
-            )
-            self.policy_ls.append(policy)
-        
-        all_params = []
-        for policy in self.policy_ls:
-            all_params += list(policy.parameters())
-        self.optimizer = optim.Adam(all_params, lr=model_config.getfloat('lr_init'))
-        self.parameters = all_params
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, 
-            step_size=1000,  
-            gamma= 0.95) 
-        # Buffer
+        # Buffer for reinforcement learning
         self.buffer = PPOBuffer(
             gamma=model_config.getfloat("gamma"),
             lam=model_config.getfloat("gae_lambda", fallback=0.95)
         )
 
+    def add_transition(self, obs, action, reward, value, done):
+        self.buffer.add_transition(obs, action, reward, value, done)
+        
+    def reset(self):
+        for policy in self.policy_ls:
+            policy.reset()
+
+    def backward(self, R, global_step=None):
+        self.optimizer.zero_grad()
+        total_loss = self.get_loss(R)
+        total_loss.backward()
+        # ppo clip
+        nn.utils.clip_grad_norm_(self.parameters, max_norm=0.5)
+        self.optimizer.step()
+        self.scheduler.step()
+            
+    def save(self, path, final_step=None):
+        state_dict = {
+            'policies': [policy.state_dict() for policy in self.policy_ls],
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+        }
+        torch.save(state_dict, path)
+        print(f"Model saved to {path}")
+
+    def load(self, path, map_location=None):
+        checkpoint = torch.load(path, map_location=map_location)
+        for policy, policy_state in zip(self.policy_ls, checkpoint['policies']):
+            policy.load_state_dict(policy_state)
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        print(f"Model loaded from {path}")
+        return True
+
+class MultiAgentPolicyPPOWrapper(TorchWrapper):
+    def __init__(self, n_s_ls, n_a_ls, n_w_ls, model_config):
+        super(MultiAgentPolicyPPOWrapper, self).__init__(n_s_ls, n_a_ls, n_w_ls, model_config)
+        self.name = 'ippo'
+
+        # 加载类的模型参数，优化器和lr scheduler
+        # 加载参数
+        for i, (n_s, n_w, n_a) in enumerate(zip(n_s_ls, n_w_ls, n_a_ls)):
+            policy = TorchLstmPolicy(
+                n_s=n_s - n_w, 
+                n_a=n_a, 
+                n_w=n_w,
+                n_step = self.n_step,
+                model_config=model_config,
+                agent_name=f"{i}_ppo_agent"
+            )
+            self.policy_ls.append(policy)
+        
+        for policy in self.policy_ls:
+            self.parameters += list(policy.parameters())
+        self.optimizer = optim.Adam(self.parameters , lr=model_config.getfloat('lr_init'))
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma= 0.95)
+
             
     def forward(self, obs, done, out_type='pv'):
-        """
-        obs: List of obs for each agent [obs_0, obs_1, ..., obs_n]
-        done: bool, done flag (usually reset lstm)
-        out_type: 'pv', 'p', 'v'
-        """
         out1, out2 = [], []
         for i in range(self.n_agent):
-            cur_out = self.policy_ls[i].forward(obs[i], done, out_type)
+            cur_out = self.policy_ls[i](obs[i], done, out_type)
             if isinstance(cur_out, tuple):
                 out1.append(cur_out[0])
                 out2.append(cur_out[1])
@@ -431,14 +464,9 @@ class MultiAgentPolicyPPOWrapper:
             return out1, out2
         else:
             return out1
-
-    def add_transition(self, obs, action, reward, value, done):
-        self.buffer.add_transition(obs, action, reward, value, done)
-
-    def backward(self, R, global_step=None):
+    
+    def get_loss(self, R):
         obs, actions, dones, returns, advantages = self.buffer.compute_returns_and_advantages(R)
-
-        self.optimizer.zero_grad()
         policy_loss, value_loss, entropy_loss = 0.0, 0.0, 0.0
 
         for t in range(len(obs)):
@@ -469,51 +497,18 @@ class MultiAgentPolicyPPOWrapper:
                 policy_loss += policy_loss_i
                 value_loss += value_loss_i
                 entropy_loss += entropy
-
         total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
-        total_loss.backward()
-        print('backward once')
-        total_loss.detach()
-        nn.utils.clip_grad_norm_(self.parameters, max_norm=0.5)
-        self.optimizer.step()
-        self.scheduler.step()
-
         self.buffer.clear()
-
-    def reset(self):
-        """
-        清空每个policy的LSTM隐藏状态。
-        """
-        for policy in self.policy_ls:
-            policy.reset()
-            
-    def save(self, path, final_step=None):
-        state_dict = {
-            'policies': [policy.state_dict() for policy in self.policy_ls],
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-        }
-        torch.save(state_dict, path)
-        print(f"Model saved to {path}")
-
-    def load(self, path, map_location=None):
-        checkpoint = torch.load(path, map_location=map_location)
-        for policy, policy_state in zip(self.policy_ls, checkpoint['policies']):
-            policy.load_state_dict(policy_state)
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        print(f"Model loaded from {path}")
-        return True
+        return total_loss
         
         
-class MultiAgentPolicyIC3NetWrapper:
+class MultiAgentPolicyIC3NetWrapper(TorchWrapper):
     def __init__(self, n_s_ls, n_a_ls, n_w_ls, model_config):
-        self.n_agent = len(n_s_ls)
-        self.policy_ls = []
+        super(MultiAgentPolicyIC3NetWrapper, self).__init__(n_s_ls, n_a_ls, n_w_ls, model_config)
         self.name = 'ic3net'
-        self.n_step = model_config.getint('batch_size')
-        self.n_c = model_config.getint('num_lstm', fallback=128)
 
+        # 加载类的模型参数，优化器和lr scheduler
+        self.n_c = model_config.getint('num_lstm', fallback=128)
         for i, (n_s, n_w, n_a) in enumerate(zip(n_s_ls, n_w_ls, n_a_ls)):
             policy = TorchLstmIC3NetPolicy(
                 n_s=n_s - n_w, 
@@ -525,29 +520,15 @@ class MultiAgentPolicyIC3NetWrapper:
             )
             self.policy_ls.append(policy)
         
-        all_params = []
         for policy in self.policy_ls:
-            all_params += list(policy.parameters())
-        self.optimizer = optim.Adam(all_params, lr=model_config.getfloat('lr_init'))
-        self.parameters = all_params
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, 
-            step_size=1000,  
-            gamma= 0.95) 
-        # Buffer
-        self.buffer = PPOBuffer(
-            gamma=model_config.getfloat("gamma"),
-            lam=model_config.getfloat("gae_lambda", fallback=0.95)
-        )
+            self.parameters += list(policy.parameters())
+        self.optimizer = optim.Adam(self.parameters, lr=model_config.getfloat('lr_init'))
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma= 0.95) 
+        # commuicate signal
         self.comm = torch.zeros((1, self.n_c))
 
             
     def forward(self, obs, done, out_type='pv'):
-        """
-        obs: List of obs for each agent [obs_0, obs_1, ..., obs_n]
-        done: bool, done flag (usually reset lstm)
-        out_type: 'pv', 'p', 'v'
-        """
         out1, out2 = [], []
         comm = torch.zeros((1, self.n_c))
         for i in range(self.n_agent):
@@ -563,14 +544,9 @@ class MultiAgentPolicyIC3NetWrapper:
             return out1, out2
         else:
             return out1
-
-    def add_transition(self, obs, action, reward, value, done):
-        self.buffer.add_transition(obs, action, reward, value, done)
-
-    def backward(self, R, global_step=None):
+        
+    def get_loss(self, R):
         obs, actions, dones, returns, advantages = self.buffer.compute_returns_and_advantages(R)
-
-        self.optimizer.zero_grad()
         policy_loss, value_loss, entropy_loss = 0.0, 0.0, 0.0
         self.comm = torch.zeros((1, self.n_c))
 
@@ -606,48 +582,20 @@ class MultiAgentPolicyIC3NetWrapper:
             self.comm = comm / self.n_agent
 
         total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
-        total_loss.backward()
-        print('backward once')
-        total_loss.detach()
-        nn.utils.clip_grad_norm_(self.parameters, max_norm=0.5)
-        self.optimizer.step()
-        self.scheduler.step()
-
         self.buffer.clear()
+        return total_loss
 
     def reset(self):
-        """
-        清空每个policy的LSTM隐藏状态。
-        """
         for policy in self.policy_ls:
             policy.reset()
+        # 需要额外清空communicate signal
         self.comm = torch.zeros((1, self.n_c))
-            
-    def save(self, path, final_step=None):
-        state_dict = {
-            'policies': [policy.state_dict() for policy in self.policy_ls],
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-        }
-        torch.save(state_dict, path)
-        print(f"Model saved to {path}")
-
-    def load(self, path, map_location=None):
-        checkpoint = torch.load(path, map_location=map_location)
-        for policy, policy_state in zip(self.policy_ls, checkpoint['policies']):
-            policy.load_state_dict(policy_state)
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        print(f"Model loaded from {path}")
-        return True
         
         
-class MultiAgentPolicyIC3NetAttnWrapper:
+class MultiAgentPolicyIC3NetAttnWrapper(TorchWrapper):
     def __init__(self, n_s_ls, n_a_ls, n_w_ls, model_config):
-        self.n_agent = len(n_s_ls)
-        self.policy_ls = []
-        self.name = 'ic3net'
-        self.n_step = model_config.getint('batch_size')
+        super(MultiAgentPolicyIC3NetAttnWrapper, self).__init__(n_s_ls, n_a_ls, n_w_ls, model_config)
+        self.name = 'ic3netattn'
         self.n_c = model_config.getint('num_lstm', fallback=128)
 
         for i, (n_s, n_w, n_a) in enumerate(zip(n_s_ls, n_w_ls, n_a_ls)):
@@ -661,29 +609,14 @@ class MultiAgentPolicyIC3NetAttnWrapper:
             )
             self.policy_ls.append(policy)
         
-        all_params = []
         for policy in self.policy_ls:
-            all_params += list(policy.parameters())
-        self.optimizer = optim.Adam(all_params, lr=model_config.getfloat('lr_init'))
-        self.parameters = all_params
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, 
-            step_size=1000,  
-            gamma= 0.95) 
-        # Buffer
-        self.buffer = PPOBuffer(
-            gamma=model_config.getfloat("gamma"),
-            lam=model_config.getfloat("gae_lambda", fallback=0.95)
-        )
+            self.parameters += list(policy.parameters())
+        self.optimizer = optim.Adam(self.parameters, lr=model_config.getfloat('lr_init'))
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma= 0.95)
         self.comm = torch.zeros((self.n_agent, self.n_c))
 
             
     def forward(self, obs, done, out_type='pv'):
-        """
-        obs: List of obs for each agent [obs_0, obs_1, ..., obs_n]
-        done: bool, done flag (usually reset lstm)
-        out_type: 'pv', 'p', 'v'
-        """
         out1, out2 = [], []
         comm = []
         for i in range(self.n_agent):
@@ -700,13 +633,8 @@ class MultiAgentPolicyIC3NetAttnWrapper:
         else:
             return out1
 
-    def add_transition(self, obs, action, reward, value, done):
-        self.buffer.add_transition(obs, action, reward, value, done)
-
-    def backward(self, R, global_step=None):
+    def get_loss(self, R):
         obs, actions, dones, returns, advantages = self.buffer.compute_returns_and_advantages(R)
-
-        self.optimizer.zero_grad()
         policy_loss, value_loss, entropy_loss = 0.0, 0.0, 0.0
         self.comm = torch.zeros((self.n_agent, self.n_c))
 
@@ -742,37 +670,11 @@ class MultiAgentPolicyIC3NetAttnWrapper:
             self.comm = torch.stack(comm, dim=0)
 
         total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy_loss
-        total_loss.backward()
-        print('backward once')
-        total_loss.detach()
-        nn.utils.clip_grad_norm_(self.parameters, max_norm=0.5)
-        self.optimizer.step()
-        self.scheduler.step()
-
         self.buffer.clear()
+        return total_loss
 
     def reset(self):
-        """
-        清空每个policy的LSTM隐藏状态。
-        """
         for policy in self.policy_ls:
             policy.reset()
-        self.comm = torch.zeros((1, self.n_c))
-            
-    def save(self, path, final_step=None):
-        state_dict = {
-            'policies': [policy.state_dict() for policy in self.policy_ls],
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-        }
-        torch.save(state_dict, path)
-        print(f"Model saved to {path}")
-
-    def load(self, path, map_location=None):
-        checkpoint = torch.load(path, map_location=map_location)
-        for policy, policy_state in zip(self.policy_ls, checkpoint['policies']):
-            policy.load_state_dict(policy_state)
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
-        print(f"Model loaded from {path}")
-        return True
+        # 需要额外清空communicate signal
+        self.comm = torch.zeros((self.n_agent, self.n_c))

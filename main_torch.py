@@ -12,8 +12,8 @@ import threading
 from envs.small_grid_env import SmallGridEnv, SmallGridController
 from envs.large_grid_env import LargeGridEnv, LargeGridController
 from envs.real_net_env import RealNetEnv, RealNetController
-from agents.models import A2C, IA2C, MA2C, IQL, MultiAgentPolicyPPOWrapper, MultiAgentPolicyIC3NetWrapper,MultiAgentPolicyIC3NetAttnWrapper
-from utils import (Counter, Trainer, Tester, Evaluator, TorchTrainer, TorchEvaluator,
+from agents.models import MultiAgentPolicyPPOWrapper, MultiAgentPolicyIC3NetWrapper,MultiAgentPolicyIC3NetAttnWrapper
+from utils import (Counter, TorchTrainer, TorchEvaluator,
                    check_dir, copy_file, find_file,
                    init_dir, init_log, init_test_flag,
                    plot_evaluation, plot_train)
@@ -114,16 +114,9 @@ def train(args):
     else:
         print('Not support torch yet')
 
-    # disable multi-threading for safe SUMO implementation
-    # threads = []
     summary_writer = tf.summary.FileWriter(dirs['log'])
     trainer = TorchTrainer(env, model, global_counter, summary_writer, in_test, output_path=dirs['data'])
     trainer.run()
-
-    # post-training test
-    # if post_test:
-    #     tester = Tester(env, model, global_counter, summary_writer, dirs['data'])
-    #     tester.run_offline(dirs['data'])
 
     # save model
     final_step = global_counter.cur_step
@@ -152,13 +145,8 @@ def evaluate_fn(agent_dir, output_dir, seeds, port, demo, policy_type):
     # load model for agent
     if agent != 'greedy':
         # init centralized or multi agent
-        if agent == 'a2c':
-            model = A2C(env.n_s, env.n_a, 0, config['MODEL_CONFIG'])
-        elif agent == 'ia2c':
-            model = IA2C(env.n_s_ls, env.n_a_ls, env.n_w_ls, 0, config['MODEL_CONFIG'])
-        elif 'ma2c' in agent:
-            model = MA2C(env.n_s_ls, env.n_a_ls, env.n_w_ls, env.n_f_ls, 0, config['MODEL_CONFIG'])
-        elif 'ippo' in agent:
+        # agent名称中包含env类型和reward类型，因此用in来判断
+        if 'ippo' in agent:
             model = MultiAgentPolicyPPOWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
             print("Eval policy IPPO")
         elif 'ic3netattn' in agent:
@@ -167,12 +155,8 @@ def evaluate_fn(agent_dir, output_dir, seeds, port, demo, policy_type):
         elif 'ic3net' in agent:
             model = MultiAgentPolicyIC3NetWrapper(env.n_s_ls, env.n_a_ls, env.n_w_ls, config['MODEL_CONFIG'])
             print("Eval policy IC3Net")
-        elif agent == 'iqld':
-            model = IQL(env.n_s_ls, env.n_a_ls, env.n_w_ls, 0, config['MODEL_CONFIG'],
-                        seed=0, model_type='dqn')
         else:
-            model = IQL(env.n_s_ls, env.n_a_ls, env.n_w_ls, 0, config['MODEL_CONFIG'],
-                        seed=0, model_type='lr')
+            logging.error('Evaluation: Not support torch yet')
         if not model.load(agent_dir + '/model/model.pt'):
             return
     else:

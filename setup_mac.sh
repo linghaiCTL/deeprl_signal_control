@@ -1,5 +1,6 @@
 # a better practice is to use a conda env
 sudo pip3 install tensorflow==1.12.0
+sudo pip3 install torch
 sudo pip3 install matplotlib
 sudo pip3 install seaborn
 # sumo==1.1.0

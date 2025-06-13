@@ -410,14 +410,6 @@ class TorchTrainer():
         if run_test:
             self.test_num = self.env.test_num
             logging.info('Testing: total test num: %d' % self.test_num)
-        self._init_summary()
-
-    def _init_summary(self):
-        self.train_reward = torch.tensor(0.0)
-        self.test_reward = torch.tensor(0.0)
-
-    def _add_summary(self, reward, global_step, is_train=True):
-        pass
 
     def explore(self, prev_ob, prev_done):
         ob = prev_ob
@@ -509,7 +501,6 @@ class TorchTrainer():
                            'std_reward': std_reward}
                     self.data.append(log)
                 avg_reward = np.mean(rewards)
-                self._add_summary(avg_reward, global_step, is_train=False)
                 logging.info(f"Testing: global step {global_step}, avg R: {avg_reward:.2f}")
 
             self.env.train_mode = True
@@ -533,12 +524,10 @@ class TorchTrainer():
             std_reward = np.std(rewards)
             log = {'agent': self.agent,
                    'step': global_step,
-                   'test_id': -1,
                    'avg_reward': mean_reward,
                    'std_reward': std_reward}
             print(log)
             self.data.append(log)
-            self._add_summary(mean_reward, global_step)
             self.summary_writer.flush()
 
         df = pd.DataFrame(self.data)
@@ -553,10 +542,6 @@ class TorchTester(TorchTrainer):
         self.output_path = output_path
         self.data = []
         logging.info('Testing: total test num: %d' % self.test_num)
-
-    def _init_summary(self):
-        self.reward = tf.placeholder(tf.float32, [])
-        self.summary = tf.summary.scalar('test_reward', self.reward)
 
     def run_offline(self):
         # enable traffic measurments for offline test
@@ -591,7 +576,6 @@ class TorchTester(TorchTrainer):
                            'reward': cur_reward}
                     self.data.append(log)
                 avg_reward = np.mean(np.array(rewards))
-                self._add_summary(avg_reward, global_step)
                 logging.info('Testing: global step %d, avg R: %.2f' %
                              (global_step, avg_reward))
                 # self.global_counter.update_test(avg_reward)
